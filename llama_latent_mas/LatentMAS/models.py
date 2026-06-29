@@ -512,7 +512,37 @@ class ModelWrapper:
             last_hidden = outputs.hidden_states[-1][:, -1, :]
 
         return past, full_attention_mask
-    
+
+    @torch.no_grad()
+    def append_token_to_past_batch(
+        self,
+        token_id: int,
+        past_key_values: Any,
+        past_attention_mask: torch.Tensor,
+    ) -> Tuple[Any, torch.Tensor]:
+        # Feed a single token (e.g. the assistant end-of-turn marker) through the
+        # model so the existing KV cache gains a proper turn boundary before the
+        # next agent prompt is appended.
+        batch_size = past_attention_mask.shape[0]
+        token_ids = torch.full(
+            (batch_size, 1), token_id, dtype=torch.long, device=self.device
+        )
+        new_mask = torch.ones(
+            (batch_size, 1),
+            dtype=past_attention_mask.dtype,
+            device=past_attention_mask.device,
+        )
+        full_attention_mask = torch.cat([past_attention_mask, new_mask], dim=-1)
+        outputs = self.model(
+            input_ids=token_ids,
+            attention_mask=full_attention_mask,
+            past_key_values=past_key_values,
+            use_cache=True,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        return outputs.past_key_values, full_attention_mask
+
     @torch.no_grad()
     def generate_latent_batch_hidden_state(
         self,

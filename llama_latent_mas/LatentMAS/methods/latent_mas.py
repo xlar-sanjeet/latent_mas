@@ -219,6 +219,16 @@ class LatentMASMethod:
                         past_attention_mask, tokens_to_keep
                     )
 
+                # Close the assistant turn in the cache so the next agent prompt
+                # starts on a clean boundary instead of continuing this latent
+                # response. Llama uses <|eot_id|>; Qwen uses <|im_end|>.
+                eot_token = "<|eot_id|>" if self.model.model_type == "llama" else "<|im_end|>"
+                eot_id = self.model.tokenizer.convert_tokens_to_ids(eot_token)
+                if eot_id is not None and eot_id >= 0 and eot_id != self.model.tokenizer.unk_token_id:
+                    past_kv, past_attention_mask = self.model.append_token_to_past_batch(
+                        eot_id, past_kv, past_attention_mask
+                    )
+
                 for idx in range(batch_size):
                     mask = wrapped_mask[idx].bool()
                     trimmed_ids = wrapped_ids[idx][mask].to("cpu").tolist()
