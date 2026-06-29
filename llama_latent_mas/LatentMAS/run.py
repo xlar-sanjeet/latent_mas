@@ -109,6 +109,10 @@ def main():
     parser.add_argument("--text_mas_context_length", type=int, default=-1, help="TextMAS context length limit")
     parser.add_argument("--think", action="store_true", help="Manually add think token in the prompt for LatentMAS")
     parser.add_argument("--latent_space_realign", action="store_true")
+    parser.add_argument("--latent_only", action="store_true",
+                        help="Keep only the latent tokens between agents (drop prior prompt KV).")
+    parser.add_argument("--sequential_info_only", action="store_true",
+                        help="Keep only newly added tokens (latent + prompt) between agents.")
     parser.add_argument(
         "--realign_regularization",
         type=float,
