@@ -546,7 +546,12 @@ class ModelWrapper:
                 pairs = ", ".join(
                     f"{tok!r}:{p:.3f}" for tok, p in zip(toks, top_probs[b].tolist())
                 )
-                print(f"[probe] {label} | row {b}: {pairs}")
+                norm = float(h[b].float().norm())
+                max_logit = float(logits[b].float().max())
+                print(
+                    f"[probe] {label} | row {b}: {pairs} "
+                    f"| ||h||={norm:.2f} max_logit={max_logit:.2f}"
+                )
         except Exception as exc:  # diagnostics must never crash the run
             print(f"[probe] {label}: failed ({exc})")
     @torch.no_grad()
