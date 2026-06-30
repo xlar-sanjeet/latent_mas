@@ -260,7 +260,6 @@ class ModelWrapper:
             return_dict_in_generate=True,
             output_scores=False,
             past_key_values=past_key_values,
-            cache_position=cache_position,
         )
         sequences = outputs.sequences
         generations: List[str] = []
