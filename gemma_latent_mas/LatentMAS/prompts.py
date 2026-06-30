@@ -1,7 +1,15 @@
 
+def _system_message(args=None) -> str:
+    """Model-appropriate system identity. Gemma is not Qwen, so don't tell it so."""
+    model_name = (getattr(args, "model_name", "") or "").lower() if args else ""
+    if "gemma" in model_name:
+        return "You are Gemma, a helpful assistant created by Google DeepMind."
+    return "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+
+
 def build_agent_message_sequential_latent_mas(role: str, question: str, context: str = "", method=None, args=None):
 
-    system_message = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    system_message = _system_message(args)
 
     assert method in ["latent_mas"], "this prompt only for latent_mas method"
     # assert "qwen" in args.model_name.lower(), "this prompt only for qwen models"
@@ -118,7 +126,7 @@ Now, reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_
 
 def build_agent_message_hierarchical_latent_mas(role: str, question: str, context: str = "", method=None, args=None):
 
-    system_message = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    system_message = _system_message(args)
 
     assert method in ["latent_mas"], "this prompt only for latent_mas method"
     # assert "qwen" in args.model_name.lower(), "this prompt only for qwen models"
@@ -343,7 +351,7 @@ Your response:
 
 def build_agent_messages_sequential_text_mas(role: str, question: str, context: str = "", method=None, args=None):
 
-    system_message = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    system_message = _system_message(args)
 
     assert method in ["text_mas"], "only for text_mas method"
     # assert "qwen" in args.model_name.lower(), "only for qwen models"
@@ -515,7 +523,7 @@ Now, reason step by step and present your final answer clearly at the end.
 
 def build_agent_messages_hierarchical_text_mas(role: str, question: str, context: str = "", method=None, args=None):
 
-    system_message = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    system_message = _system_message(args)
     
     assert method in ["text_mas"], "this prompt only for text_mas method"
     # assert "qwen" in args.model_name.lower(), "this prompt only for qwen models"
@@ -700,7 +708,7 @@ Your response:
 
 def build_agent_messages_single_agent(question: str, args=None):
 
-    system_message = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    system_message = _system_message(args)
 
     assert args.method in ["baseline"], "this prompt only for baseline method (single agent)"
     # assert "qwen" in args.model_name.lower(), "this prompt only for qwen models"
