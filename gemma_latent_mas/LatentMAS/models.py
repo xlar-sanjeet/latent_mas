@@ -837,6 +837,38 @@ class ModelWrapper:
 
         return output_layer
 
+    def _stop_token_ids(self) -> List[int]:
+        """All token ids that should terminate manual generation.
+
+        Gemma chat-tuned models end a turn with <end_of_turn> (not <eos>), and
+        the generation_config typically lists eos_token_id as [<eos>, <end_of_turn>].
+        Relying only on tokenizer.eos_token_id (which is <eos>) means the manual
+        decode loop never early-stops and always runs the full max_new_tokens.
+        Collect every candidate stop id so the loop terminates correctly.
+        """
+        ids = set()
+
+        tok_eos = getattr(self.tokenizer, "eos_token_id", None)
+        if tok_eos is not None:
+            ids.add(int(tok_eos))
+
+        gen_cfg = getattr(self.model, "generation_config", None)
+        cfg_eos = getattr(gen_cfg, "eos_token_id", None) if gen_cfg is not None else None
+        if isinstance(cfg_eos, (list, tuple)):
+            ids.update(int(x) for x in cfg_eos)
+        elif cfg_eos is not None:
+            ids.add(int(cfg_eos))
+
+        # Gemma end-of-turn marker (chat models emit this to end their turn).
+        try:
+            eot = self.tokenizer.convert_tokens_to_ids("<end_of_turn>")
+            if eot is not None and eot >= 0:
+                ids.add(int(eot))
+        except Exception:
+            pass
+
+        return sorted(ids)
+
     def _lm_head_device(self):
         lm_head = self._get_lm_head()
         try:
@@ -1077,6 +1109,25 @@ class ModelWrapper:
         logits = lm_head(hidden)
         next_token = self._top_p_sample(logits, temperature, top_p).to(model_input_device)
 
+        batch_size = input_ids.shape[0]
+        stop_ids = torch.tensor(
+            self._stop_token_ids(),
+            dtype=torch.long,
+            device=model_input_device,
+        )
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = int(stop_ids[0].item()) if stop_ids.numel() > 0 else 0
+
+        def _is_stop(tok: torch.Tensor) -> torch.Tensor:
+            # tok: [B, 1] -> [B] boolean of whether each row emitted a stop id.
+            flat = tok.squeeze(-1)
+            if stop_ids.numel() == 0:
+                return torch.zeros_like(flat, dtype=torch.bool)
+            return (flat.unsqueeze(-1) == stop_ids.unsqueeze(0)).any(dim=-1)
+
+        finished = _is_stop(next_token)
+
         generated_tokens = [next_token]
 
         cur_attention_mask = torch.cat(
@@ -1091,7 +1142,13 @@ class ModelWrapper:
             dim=-1,
         )
 
-        eos_id = self.tokenizer.eos_token_id
+        if bool(finished.all()):
+            generated_ids = torch.cat(generated_tokens, dim=1)
+            generations = [
+                self.tokenizer.decode(row.tolist(), skip_special_tokens=True).strip()
+                for row in generated_ids
+            ]
+            return generations, past
 
         for _ in range(max_new_tokens - 1):
             past_len = _past_length(past)
@@ -1124,7 +1181,18 @@ class ModelWrapper:
             logits = lm_head(hidden)
             next_token = self._top_p_sample(logits, temperature, top_p).to(model_input_device)
 
+            # Rows that already emitted a stop token keep emitting pad so their
+            # decoded text is unaffected and the batch length stays aligned.
+            if bool(finished.any()):
+                next_token = torch.where(
+                    finished.unsqueeze(-1),
+                    torch.full_like(next_token, pad_id),
+                    next_token,
+                )
+
             generated_tokens.append(next_token)
+
+            finished = finished | _is_stop(next_token)
 
             cur_attention_mask = torch.cat(
                 [
@@ -1138,7 +1206,7 @@ class ModelWrapper:
                 dim=-1,
             )
 
-            if eos_id is not None and torch.all(next_token.squeeze(-1) == eos_id):
+            if bool(finished.all()):
                 break
 
         generated_ids = torch.cat(generated_tokens, dim=1)
