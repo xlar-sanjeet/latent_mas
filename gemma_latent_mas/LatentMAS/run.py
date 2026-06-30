@@ -112,6 +112,12 @@ def main():
                         help="Gemma per-layer-embedding (PLE) token-identity component used during latent steps. "
                              "'zero': context-only PLE (token-identity=0, current default). "
                              "'nearest': inject the nearest token's per-layer embedding as the token-identity PLE.")
+    parser.add_argument("--wa_mode", type=str, choices=["closed_form", "empirical"], default="closed_form",
+                        help="Latent realignment matrix W_a construction. "
+                             "'closed_form': paper's (Wout^T Wout + lambda I)^-1 Wout^T Win (degenerates to ~identity "
+                             "on tied-embedding models like Gemma). "
+                             "'empirical': least-squares fit of W_a from real (last_hidden_t, input_embed_{t+1}) pairs "
+                             "(stays meaningful under tied embeddings).")
     parser.add_argument("--seed", type=int, default=42)
 
     # vLLM support

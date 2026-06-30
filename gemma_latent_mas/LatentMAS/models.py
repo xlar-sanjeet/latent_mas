@@ -511,6 +511,7 @@ class ModelWrapper:
         self.pre_aligned = None
         self.debug_probe = bool(getattr(args, "debug_probe", False)) if args else False
         self.latent_ple_mode = str(getattr(args, "latent_ple_mode", "zero")) if args else "zero"
+        self.wa_mode = str(getattr(args, "wa_mode", "closed_form")) if args else "closed_form"
 
         if self.use_vllm:
             tp_size = max(1, int(getattr(args, "tensor_parallel_size", 1)))
@@ -687,6 +688,18 @@ class ModelWrapper:
         return generations
 
     def _build_latent_realign_matrix(self, model, device, args) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Empirical W_a (opt-in via --wa_mode empirical). The closed-form W_a
+        # below degenerates to ~identity on models with TIED input/output
+        # embeddings (W_out == W_in), e.g. Gemma, because then
+        #   W_a = (E^T E + lambda I)^-1 E^T (E * s) ~= s * I
+        # and the subsequent target_norm renormalization cancels even the
+        # scalar s -> the realignment becomes a no-op and latent vectors stay
+        # out-of-distribution. The empirical builder fits W_a from real
+        # (last_hidden_t, input_embedding_{t+1}) pairs and recovers a
+        # non-trivial operator even under tied embeddings.
+        if getattr(self, "wa_mode", "closed_form") == "empirical" and self.args.latent_space_realign:
+            return self._build_empirical_realign_matrix(model, device)
+
         input_embeds = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
         output_embeds = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
 
@@ -703,6 +716,13 @@ class ModelWrapper:
 
         input_weight = input_embeds.weight.detach().to(device=device, dtype=torch.float32)
         output_weight = output_embeds.weight.detach().to(device=device, dtype=torch.float32)
+
+        # Diagnostic: are input/output embeddings tied? If so the closed-form
+        # W_a is degenerate (see note above) and you should prefer --wa_mode
+        # empirical on this model.
+        tied = bool(getattr(getattr(model, "config", None), "tie_word_embeddings", False))
+        same_ptr = input_embeds.weight.data_ptr() == output_embeds.weight.data_ptr()
+        print(f"[W_a diag] tie_word_embeddings={tied} same_weight_tensor={same_ptr}")
 
         # Gemma scales token embeddings by sqrt(hidden_size) inside the
         # embedding module (Gemma3nTextScaledWordEmbedding.forward multiplies
@@ -733,6 +753,25 @@ class ModelWrapper:
 
         target_norm = input_weight.norm(dim=1).mean().detach()
 
+        # Diagnostic: how close is the closed-form W_a to a scaled identity?
+        # cos(W_a, I) near 1 (after removing scale) confirms the realignment is
+        # effectively a no-op (expected on tied-embedding models like Gemma).
+        try:
+            d = realign_matrix.shape[0]
+            eye = torch.eye(d, device=realign_matrix.device, dtype=realign_matrix.dtype)
+            cos_to_I = torch.nn.functional.cosine_similarity(
+                realign_matrix.flatten(), eye.flatten(), dim=0
+            ).item()
+            diag_mean = realign_matrix.diagonal().mean().item()
+            offdiag = realign_matrix - realign_matrix.diagonal().diag_embed()
+            offdiag_rms = offdiag.pow(2).mean().sqrt().item()
+            print(
+                f"[W_a diag] cos(W_a, I)={cos_to_I:.6f}  diag_mean={diag_mean:.4f}  "
+                f"offdiag_rms={offdiag_rms:.4f}  target_norm={float(target_norm):.4f}"
+            )
+        except Exception as exc:
+            print(f"[W_a diag] cos(W_a, I) failed: {exc}")
+
         if not self.args.latent_space_realign:
             realign_matrix = torch.eye(
                 realign_matrix.shape[0],
@@ -741,6 +780,86 @@ class ModelWrapper:
             )
 
         return realign_matrix, target_norm
+
+    def _build_empirical_realign_matrix(self, model, device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fit W_a from real (last_hidden_t, input_embedding_{t+1}) pairs.
+
+        Unlike the closed-form solution, this does not assume W_out is
+        independent of W_in, so it remains meaningful when input/output
+        embeddings are tied (Gemma). We run the model on a small fixed
+        calibration corpus, collect the final-layer hidden state h_t (which the
+        model uses to predict token t+1) and the input embedding e_{t+1} that a
+        real token t+1 would feed back in, then solve the ridge least-squares
+        problem  min_Wa || H W_a - E_next ||_F^2 .
+        """
+        calib_texts = [
+            "The capital of France is Paris, a city known for its art and history.",
+            "To solve the problem, first add the numbers, then multiply by three.",
+            "Water boils at one hundred degrees Celsius at sea level pressure.",
+            "She bought 5 apples and 3 oranges, so she had 8 pieces of fruit.",
+            "The function returns the sum of its two integer arguments.",
+            "In 1969, astronauts landed on the Moon for the very first time.",
+            "If x equals 7 and y equals 4, then x plus y equals 11.",
+            "Photosynthesis converts sunlight, water, and carbon dioxide into glucose.",
+        ]
+
+        embedding_layer = model.get_input_embeddings()
+        emb_device = embedding_layer.weight.device
+
+        h_list: List[torch.Tensor] = []
+        e_list: List[torch.Tensor] = []
+
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for text in calib_texts:
+                enc = self.tokenizer(text, return_tensors="pt", add_special_tokens=True)
+                ids = enc["input_ids"].to(emb_device)
+                if ids.shape[1] < 2:
+                    continue
+                out = model(
+                    input_ids=ids,
+                    use_cache=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                # h_t: final-layer hidden at positions 0..T-2 (predicts t+1)
+                h = out.hidden_states[-1][0, :-1, :].to(device=device, dtype=torch.float32)
+                # e_{t+1}: input embedding the model actually consumes for the
+                # next token (for Gemma this already includes embed_scale).
+                e_next = embedding_layer(ids[:, 1:])[0].to(device=device, dtype=torch.float32)
+                h_list.append(h)
+                e_list.append(e_next)
+        if was_training:
+            model.train()
+
+        H = torch.cat(h_list, dim=0)        # [N, D]
+        E = torch.cat(e_list, dim=0)        # [N, D]
+
+        gram = torch.matmul(H.T, H)
+        reg = 1e-3 * torch.eye(gram.shape[0], device=gram.device, dtype=gram.dtype)
+        realign_matrix = torch.linalg.solve(gram + reg, torch.matmul(H.T, E))
+
+        target_norm = E.norm(dim=1).mean().detach()
+
+        # Diagnostic: fit quality + distance from identity.
+        try:
+            pred = torch.matmul(H, realign_matrix)
+            resid = (pred - E).norm() / E.norm().clamp_min(1e-6)
+            d = realign_matrix.shape[0]
+            eye = torch.eye(d, device=realign_matrix.device, dtype=realign_matrix.dtype)
+            cos_to_I = torch.nn.functional.cosine_similarity(
+                realign_matrix.flatten(), eye.flatten(), dim=0
+            ).item()
+            print(
+                f"[W_a diag] EMPIRICAL pairs={H.shape[0]} rel_resid={resid.item():.4f}  "
+                f"cos(W_a, I)={cos_to_I:.6f}  target_norm={float(target_norm):.4f}"
+            )
+        except Exception as exc:
+            print(f"[W_a diag] empirical diag failed: {exc}")
+
+        return realign_matrix, target_norm
+
 
     def _ensure_latent_realign_matrix(self, model, device, args) -> Tuple[torch.Tensor, torch.Tensor]:
         key = id(model)
@@ -1336,6 +1455,17 @@ class ModelWrapper:
 
         past = outputs.past_key_values
 
+        if self.debug_probe:
+            cfg = getattr(self.model, "config", None)
+            sw = getattr(cfg, "sliding_window", None)
+            if sw is None and cfg is not None:
+                tc = getattr(cfg, "text_config", None)
+                sw = getattr(tc, "sliding_window", None) if tc is not None else None
+            print(
+                f"[KV diag] prefill cumulative_kv_len={_past_length(past)}  "
+                f"new_tokens={input_ids.shape[1]}  sliding_window={sw}"
+            )
+
         e_t = outputs.hidden_states[0][:, -1, :]
         last_hidden = outputs.hidden_states[-1][:, -1, :]
 
@@ -1403,6 +1533,9 @@ class ModelWrapper:
 
             if self.debug_probe:
                 self._probe_hidden_to_tokens(last_hidden, label=f"latent-step-{step}-output-hidden")
+
+        if self.debug_probe:
+            print(f"[KV diag] post-latent cumulative_kv_len={_past_length(past)}")
 
         return past
 
