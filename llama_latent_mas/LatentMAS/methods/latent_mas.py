@@ -73,12 +73,31 @@ class LatentMASMethod:
         if past_kv is None or tokens_to_keep <= 0:
             return None
         if Cache is not None and isinstance(past_kv, Cache):
-            legacy = past_kv.to_legacy_cache()
-            trimmed_legacy = tuple(
-                tuple(self._slice_tensor(t, tokens_to_keep) for t in layer)
-                for layer in legacy
-            )
-            return past_kv.__class__.from_legacy_cache(trimmed_legacy)
+            # transformers >=5: DynamicCache exposes .layers, each with .keys/.values.
+            if hasattr(past_kv, "layers") and past_kv.layers is not None:
+                for layer in past_kv.layers:
+                    if getattr(layer, "keys", None) is not None:
+                        layer.keys = self._slice_tensor(layer.keys, tokens_to_keep)
+                    if getattr(layer, "values", None) is not None:
+                        layer.values = self._slice_tensor(layer.values, tokens_to_keep)
+                return past_kv
+            # transformers 4.x: parallel key_cache / value_cache lists.
+            if hasattr(past_kv, "key_cache") and hasattr(past_kv, "value_cache"):
+                past_kv.key_cache = [
+                    self._slice_tensor(k, tokens_to_keep) for k in past_kv.key_cache
+                ]
+                past_kv.value_cache = [
+                    self._slice_tensor(v, tokens_to_keep) for v in past_kv.value_cache
+                ]
+                return past_kv
+            # Legacy fallback for cache classes that still expose the tuple API.
+            if hasattr(past_kv, "to_legacy_cache") and hasattr(past_kv, "from_legacy_cache"):
+                legacy = past_kv.to_legacy_cache()
+                trimmed_legacy = tuple(
+                    tuple(self._slice_tensor(t, tokens_to_keep) for t in layer)
+                    for layer in legacy
+                )
+                return past_kv.__class__.from_legacy_cache(trimmed_legacy)
         trimmed_layers = []
         for layer in past_kv:
             if isinstance(layer, tuple):
