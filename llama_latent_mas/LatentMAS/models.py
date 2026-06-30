@@ -212,6 +212,9 @@ class ModelWrapper:
         return generations
     
     def _build_latent_realign_matrix(self, model, device, args) -> Tuple[torch.Tensor, torch.Tensor]:
+        input_embeds = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
+        if input_embeds is None:
+            input_embeds = getattr(model, "embed_tokens", None)
         output_embeds = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
         if output_embeds is None:
             output_embeds = getattr(model, "lm_head", None)
