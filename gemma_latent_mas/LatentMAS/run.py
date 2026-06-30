@@ -106,6 +106,12 @@ def main():
     parser.add_argument("--text_mas_context_length", type=int, default=-1, help="TextMAS context length limit")
     parser.add_argument("--think", action="store_true", help="Manually add think token in the prompt for LatentMAS")
     parser.add_argument("--latent_space_realign", action="store_true")
+    parser.add_argument("--debug_probe", action="store_true",
+                        help="Decode latent/hidden vectors to nearest vocab tokens (+norms) during latent rollout for diagnostics.")
+    parser.add_argument("--latent_ple_mode", type=str, choices=["zero", "nearest"], default="zero",
+                        help="Gemma per-layer-embedding (PLE) token-identity component used during latent steps. "
+                             "'zero': context-only PLE (token-identity=0, current default). "
+                             "'nearest': inject the nearest token's per-layer embedding as the token-identity PLE.")
     parser.add_argument("--seed", type=int, default=42)
 
     # vLLM support

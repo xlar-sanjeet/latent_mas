@@ -509,6 +509,8 @@ class ModelWrapper:
         self._latent_realign_matrices: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self.args = args
         self.pre_aligned = None
+        self.debug_probe = bool(getattr(args, "debug_probe", False)) if args else False
+        self.latent_ple_mode = str(getattr(args, "latent_ple_mode", "zero")) if args else "zero"
 
         if self.use_vllm:
             tp_size = max(1, int(getattr(args, "tensor_parallel_size", 1)))
@@ -787,6 +789,40 @@ class ModelWrapper:
         aligned = aligned * (target_norm / aligned_norm)
         return aligned.to(hidden.dtype)
 
+    def _probe_hidden_to_tokens(self, hidden: torch.Tensor, label: str = "", topk: int = 5, model=None) -> None:
+        # Decode a hidden/latent vector [B, D] to its nearest vocabulary tokens via
+        # the output embedding (unembedding) so latent "thoughts" can be inspected.
+        # Diagnostics only; must never crash the run.
+        try:
+            probe_model = model if model is not None else getattr(self, "model", None)
+            if probe_model is None:
+                return
+            output_embeds = None
+            if hasattr(probe_model, "get_output_embeddings"):
+                output_embeds = probe_model.get_output_embeddings()
+            if output_embeds is None:
+                output_embeds = getattr(probe_model, "lm_head", None)
+            if output_embeds is None or not hasattr(output_embeds, "weight"):
+                return
+            weight = output_embeds.weight  # [V, D]
+            h = hidden.detach().to(device=weight.device, dtype=weight.dtype)
+            logits = torch.matmul(h, weight.t())  # [B, V]
+            probs = torch.softmax(logits.float(), dim=-1)
+            top_probs, top_ids = probs.topk(topk, dim=-1)
+            for b in range(h.shape[0]):
+                toks = self.tokenizer.convert_ids_to_tokens(top_ids[b].tolist())
+                pairs = ", ".join(
+                    f"{tok!r}:{p:.3f}" for tok, p in zip(toks, top_probs[b].tolist())
+                )
+                norm = float(h[b].float().norm())
+                max_logit = float(logits[b].float().max())
+                print(
+                    f"[probe] {label} | row {b}: {pairs} "
+                    f"| ||h||={norm:.2f} max_logit={max_logit:.2f}"
+                )
+        except Exception as exc:  # diagnostics must never crash the run
+            print(f"[probe] {label}: failed ({exc})")
+
     def _get_lm_head(self):
         output_layer = None
 
@@ -911,20 +947,44 @@ class ModelWrapper:
             # reverse-embed lookup in get_per_layer_inputs. forward then runs
             # project_per_layer_inputs(latent_embed, zeros) once -> context PLE
             # only. Token-identity PLE is correctly absent (no token id).
+            #
+            # Ablation (--latent_ple_mode):
+            #   'zero'    : token-identity PLE = 0 (context-only; default).
+            #   'nearest' : decode each latent to its nearest vocab token and use
+            #               that token's per-layer embedding as the token-identity
+            #               PLE, so forward produces (context + token_ple)/sqrt(2)
+            #               exactly like a real token. Measures the impact of the
+            #               zero-PLE approximation.
             # ==================================================
             B, L = latent_embed.shape[0], latent_embed.shape[1]
-            zero_token_ple = torch.zeros(
-                B,
-                L,
-                lm.config.num_hidden_layers,
-                lm.config.hidden_size_per_layer_input,
-                dtype=latent_embed.dtype,
-                device=lm_device,
-            )
+            if self.latent_ple_mode == "nearest" and hasattr(lm, "embed_tokens_per_layer"):
+                # Nearest token by dot product against the main embedding table.
+                embed_weight = lm.embed_tokens.weight  # [V, D]
+                flat = latent_embed.reshape(B * L, latent_embed.shape[-1]).to(
+                    device=embed_weight.device, dtype=embed_weight.dtype
+                )
+                nearest_ids = torch.matmul(flat, embed_weight.t()).argmax(dim=-1)
+                nearest_ids = nearest_ids.reshape(B, L).to(lm_device)
+                token_ple = lm.embed_tokens_per_layer(nearest_ids).reshape(
+                    B,
+                    L,
+                    lm.config.num_hidden_layers,
+                    lm.config.hidden_size_per_layer_input,
+                ).to(dtype=latent_embed.dtype, device=lm_device)
+                per_layer_inputs = token_ple
+            else:
+                per_layer_inputs = torch.zeros(
+                    B,
+                    L,
+                    lm.config.num_hidden_layers,
+                    lm.config.hidden_size_per_layer_input,
+                    dtype=latent_embed.dtype,
+                    device=lm_device,
+                )
 
             kwargs = dict(
                 inputs_embeds=latent_embed,
-                per_layer_inputs=zero_token_ple,
+                per_layer_inputs=per_layer_inputs,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 use_cache=True,
@@ -1211,6 +1271,9 @@ class ModelWrapper:
         e_t = outputs.hidden_states[0][:, -1, :]
         last_hidden = outputs.hidden_states[-1][:, -1, :]
 
+        if self.debug_probe:
+            self._probe_hidden_to_tokens(last_hidden, label="prompt-final-hidden")
+
         # Running attention mask. Starts from the prefill mask so left-padding
         # positions stay masked (0) throughout the latent steps. With batching
         # (generate_bs > 1) shorter prompts are left-padded; an all-ones mask
@@ -1228,6 +1291,9 @@ class ModelWrapper:
                 last_hidden,
                 source_model,
             )
+
+            if self.debug_probe:
+                self._probe_hidden_to_tokens(latent_vec, label=f"latent-step-{step}-input-embed")
 
             print(f"\n[Latent Step {step}]")
             print("last_hidden shape:", last_hidden.shape)
@@ -1266,6 +1332,9 @@ class ModelWrapper:
 
             past = outputs.past_key_values
             last_hidden = outputs.hidden_states[-1][:, -1, :]
+
+            if self.debug_probe:
+                self._probe_hidden_to_tokens(last_hidden, label=f"latent-step-{step}-output-hidden")
 
         return past
 
@@ -1317,6 +1386,9 @@ class ModelWrapper:
         past = outputs.past_key_values
         last_hidden = outputs.hidden_states[-1][:, -1, :]
 
+        if self.debug_probe:
+            self._probe_hidden_to_tokens(last_hidden, label="prompt-final-hidden", model=self.HF_model)
+
         # See generate_latent_batch: preserve the prefill mask so latent steps
         # never attend to left-padding positions when batching.
         running_mask = attention_mask
@@ -1332,6 +1404,9 @@ class ModelWrapper:
                 last_hidden,
                 source_model,
             )
+
+            if self.debug_probe:
+                self._probe_hidden_to_tokens(latent_vec, label=f"latent-step-{step}-input-embed", model=self.HF_model)
 
             print(f"\n[Latent Step {step}]")
             print("latent_vec norm:", latent_vec.norm().item())
@@ -1364,6 +1439,9 @@ class ModelWrapper:
 
             past = outputs.past_key_values
             last_hidden = outputs.hidden_states[-1][:, -1, :]
+
+            if self.debug_probe:
+                self._probe_hidden_to_tokens(last_hidden, label=f"latent-step-{step}-output-hidden", model=self.HF_model)
 
             curr_output_embedding.append(latent_embed.detach())
 
