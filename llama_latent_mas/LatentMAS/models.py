@@ -72,6 +72,7 @@ class ModelWrapper:
         self.vllm_engine = None
         self.latent_space_realign = bool(getattr(args, "latent_space_realign", False)) if args else False
         self._latent_realign_matrices: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self.debug_probe = bool(getattr(args, "debug_probe", False)) if args else False
         self.args = args
 
         # Detect the model family once so callers can apply family-specific behavior.
@@ -211,7 +212,6 @@ class ModelWrapper:
         return generations
     
     def _build_latent_realign_matrix(self, model, device, args) -> Tuple[torch.Tensor, torch.Tensor]:
-        input_embeds = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
         output_embeds = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
         if output_embeds is None:
             output_embeds = getattr(model, "lm_head", None)
@@ -463,6 +463,9 @@ class ModelWrapper:
         last_hidden = outputs.hidden_states[-1][:, -1, :] # [B, D]
         h_t = last_hidden.detach().clone()
 
+        if self.debug_probe:
+            self._probe_hidden_to_tokens(last_hidden, label="prompt-final-hidden")
+
         e_t_plus_1 = None
         latent_vecs_all: List[torch.Tensor] = []
         latent_vecs_all.append(e_t.detach().clone())
@@ -475,6 +478,9 @@ class ModelWrapper:
             latent_vec = self._apply_latent_realignment(last_hidden, source_model)
 
             latent_vecs_all.append(latent_vec.detach().clone())
+
+            if self.debug_probe:
+                self._probe_hidden_to_tokens(latent_vec, label=f"latent-step-{step}-input-embed")
 
             if step == 0:
                 e_t_plus_1 = latent_vec.detach().clone()
@@ -511,8 +517,35 @@ class ModelWrapper:
             past = outputs.past_key_values
             last_hidden = outputs.hidden_states[-1][:, -1, :]
 
+            if self.debug_probe:
+                self._probe_hidden_to_tokens(last_hidden, label=f"latent-step-{step}-output-hidden")
+
         return past, full_attention_mask
 
+    @torch.no_grad()
+    def _probe_hidden_to_tokens(self, hidden: torch.Tensor, label: str = "", topk: int = 5) -> None:
+        # Decode a hidden/latent vector [B, D] to its nearest vocabulary tokens via
+        # the output embedding (unembedding) so latent "thoughts" can be inspected.
+        try:
+            model = self.model
+            output_embeds = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
+            if output_embeds is None:
+                output_embeds = getattr(model, "lm_head", None)
+            if output_embeds is None or not hasattr(output_embeds, "weight"):
+                return
+            weight = output_embeds.weight  # [V, D]
+            h = hidden.detach().to(weight.dtype)
+            logits = torch.matmul(h, weight.t())  # [B, V]
+            probs = torch.softmax(logits.float(), dim=-1)
+            top_probs, top_ids = probs.topk(topk, dim=-1)
+            for b in range(h.shape[0]):
+                toks = self.tokenizer.convert_ids_to_tokens(top_ids[b].tolist())
+                pairs = ", ".join(
+                    f"{tok!r}:{p:.3f}" for tok, p in zip(toks, top_probs[b].tolist())
+                )
+                print(f"[probe] {label} | row {b}: {pairs}")
+        except Exception as exc:  # diagnostics must never crash the run
+            print(f"[probe] {label}: failed ({exc})")
     @torch.no_grad()
     def append_token_to_past_batch(
         self,

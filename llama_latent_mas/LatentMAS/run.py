@@ -113,6 +113,8 @@ def main():
                         help="Keep only the latent tokens between agents (drop prior prompt KV).")
     parser.add_argument("--sequential_info_only", action="store_true",
                         help="Keep only newly added tokens (latent + prompt) between agents.")
+    parser.add_argument("--debug_probe", action="store_true",
+                        help="Decode latent vectors to nearest vocabulary tokens for debugging.")
     parser.add_argument(
         "--realign_regularization",
         type=float,
