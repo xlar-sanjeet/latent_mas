@@ -181,6 +181,27 @@ class ModelWrapper:
         realign_matrix = torch.linalg.solve(gram, rhs)
         target_norm = input_weight.norm(dim=1).mean().detach()
 
+        if self.debug_probe:
+            cfg = getattr(model, "config", None)
+            tie = bool(getattr(cfg, "tie_word_embeddings", False)) if cfg is not None else None
+            same_tensor = (
+                input_embeds.weight.data_ptr() == output_embeds.weight.data_ptr()
+            )
+            n = realign_matrix.shape[0]
+            eye = torch.eye(n, device=realign_matrix.device, dtype=realign_matrix.dtype)
+            diag_mean = realign_matrix.diagonal().mean().item()
+            offdiag = realign_matrix - eye * realign_matrix.diagonal().unsqueeze(0)
+            offdiag_rms = offdiag.pow(2).mean().sqrt().item()
+            cos_wa_i = torch.nn.functional.cosine_similarity(
+                realign_matrix.flatten(), eye.flatten(), dim=0
+            ).item()
+            print(
+                f"[W_a diag] tie_word_embeddings={tie} same_weight_tensor={same_tensor} "
+                f"cos(W_a,I)={cos_wa_i:.6f} diag_mean={diag_mean:.4f} "
+                f"offdiag_rms={offdiag_rms:.4f} target_norm={target_norm.item():.4f}",
+                flush=True,
+            )
+
         if self.args.latent_space_realign:
             pass
         else:
@@ -319,6 +340,15 @@ class ModelWrapper:
         h_t = last_hidden.detach().clone()
 
         if self.debug_probe:
+            cfg = getattr(self.model, "config", None)
+            sw = getattr(cfg, "sliding_window", None) if cfg is not None else None
+            use_sw = getattr(cfg, "use_sliding_window", None) if cfg is not None else None
+            max_win = getattr(cfg, "max_window_layers", None) if cfg is not None else None
+            print(
+                f"[attn diag] use_sliding_window={use_sw} sliding_window={sw} "
+                f"max_window_layers={max_win} prefill_cumulative_kv_len={_past_length(past)}",
+                flush=True,
+            )
             self._probe_hidden_to_tokens(last_hidden, label="prompt-final-hidden")
 
         e_t_plus_1 = None
@@ -359,6 +389,12 @@ class ModelWrapper:
 
             if self.debug_probe:
                 self._probe_hidden_to_tokens(last_hidden, label=f"latent-step-{step}-output-hidden")
+
+        if self.debug_probe:
+            print(
+                f"[attn diag] post_latent_cumulative_kv_len={_past_length(past)}",
+                flush=True,
+            )
 
         return past
 
