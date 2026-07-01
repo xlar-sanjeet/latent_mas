@@ -29,6 +29,30 @@ def evaluate(preds: List[Dict]) -> Tuple[float, int]:
     acc = correct / total if total > 0 else 0.0
     return acc, correct
 
+
+def compute_token_stats(preds: List[Dict], tokenizer) -> Dict[str, int]:
+    """Aggregate input (prompt) and output (generated) token counts across all
+    agents of every sample. Input counts come from the per-agent ``input_tokens``
+    list already stored in each trace; output counts are obtained by
+    re-tokenizing each agent's generated text with the model tokenizer."""
+    total_input = 0
+    total_output = 0
+    for p in preds:
+        for a in p.get("agents", []):
+            input_tokens = a.get("input_tokens")
+            if input_tokens is not None:
+                total_input += len(input_tokens)
+            output_text = a.get("output", "")
+            if output_text:
+                total_output += len(
+                    tokenizer(output_text, add_special_tokens=False)["input_ids"]
+                )
+    return {
+        "total_input_tokens": total_input,
+        "total_output_tokens": total_output,
+        "total_tokens": total_input + total_output,
+    }
+
 # Main processing function for each batch
 def process_batch(
     method,
@@ -228,7 +252,10 @@ def main():
     total_time = time.time() - start_time
 
     acc, correct = evaluate(preds)
-    
+
+    token_stats = compute_token_stats(preds, model.tokenizer)
+    n = args.max_samples if args.max_samples > 0 else 1
+
     # Load results in JSON format
     print(
         json.dumps(
@@ -242,6 +269,12 @@ def main():
                 "correct": correct,
                 "total_time_sec": round(total_time,4),
                 "time_per_sample_sec": round(total_time / args.max_samples, 4),
+                "total_input_tokens": token_stats["total_input_tokens"],
+                "total_output_tokens": token_stats["total_output_tokens"],
+                "total_tokens": token_stats["total_tokens"],
+                "input_tokens_per_sample": round(token_stats["total_input_tokens"] / n, 2),
+                "output_tokens_per_sample": round(token_stats["total_output_tokens"] / n, 2),
+                "tokens_per_sample": round(token_stats["total_tokens"] / n, 2),
             },
             ensure_ascii=False,
         )
