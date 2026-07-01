@@ -24,27 +24,46 @@ def auto_device(device: Optional[str] = None) -> torch.device:
 
 # this is to extract answer in \boxed{}
 def extract_gsm8k_answer(text: str) -> Optional[str]:
-    boxes = re.findall(r"\\boxed\{([^}]*)\}", text)
-    if boxes:
-        content = boxes[-1]
-        number = re.search(r"[-+]?\d+(?:\.\d+)?", content)
-        return number.group(0) if number else content.strip()
+    # Strip thousands separators so "$70,000" is read as a single number 70000
+    # rather than being truncated to "70" at the first comma.
+    cleaned = re.sub(r"(?<=\d),(?=\d)", "", text)
 
-    numbers = re.findall(r"[-+]?\d+(?:\.\d+)?", text)
+    boxes = re.findall(r"\\boxed\{([^}]*)\}", cleaned)
+    # Walk boxes from last to first and skip the literal prompt placeholder
+    # ("YOUR_FINAL_ANSWER") that gets echoed back when generation is truncated
+    # before the model emits a real \boxed{} answer.
+    for content in reversed(boxes):
+        stripped = content.strip()
+        if not stripped or "YOUR_FINAL_ANSWER" in stripped.upper():
+            continue
+        number = re.search(r"[-+]?\d+(?:\.\d+)?", stripped)
+        return number.group(0) if number else stripped
+
+    numbers = re.findall(r"[-+]?\d+(?:\.\d+)?", cleaned)
     if numbers:
         return numbers[-1]
     return None
 
 
 def extract_gold(text: str) -> Optional[str]:
-    match = re.search(r"####\s*([-+]?\d+(?:\.\d+)?)", text)
-    return match.group(1) if match else None
+    match = re.search(r"####\s*([-+]?[\d,]+(?:\.\d+)?)", text)
+    if not match:
+        return None
+    return match.group(1).replace(",", "")
 
 
 def normalize_answer(ans: Optional[str]) -> Optional[str]:
     if ans is None:
         return None
-    return ans.strip().lower()
+    s = ans.strip().lower().replace(",", "").replace("$", "")
+    # Canonicalize numbers so "64.00" == "64", "18.0" == "18" compare equal.
+    try:
+        f = float(s)
+        if f == int(f):
+            return str(int(f))
+        return repr(f)
+    except (ValueError, OverflowError):
+        return s
 
 
 def extract_markdown_python_block(text: str) -> Optional[str]:
