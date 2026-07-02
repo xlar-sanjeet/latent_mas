@@ -42,9 +42,6 @@ class LatentMASMethod:
         self.HF_device = args.device2
         self.latent_only = bool(getattr(args, "latent_only", False)) if args else False
         self.sequential_info_only = bool(getattr(args, "sequential_info_only", False)) if args else False
-        # Experimental Llama turn-boundary fixes (BOS strip + eot append). Default
-        # OFF: the plain path matches the proven Qwen pipeline.
-        self.latent_turn_fixes = bool(getattr(args, "latent_turn_fixes", False)) if args else False
 
         if self.latent_only:
             self.sequential_info_only = True
@@ -122,56 +119,6 @@ class LatentMASMethod:
         keep = min(tokens_to_keep, mask.shape[-1])
         return mask[..., -keep:].contiguous()
 
-    def _strip_bos_from_cached_batch(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        past_key_values: Optional[Any],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # When continuing inside an existing KV cache, the model has already seen a
-        # BOS at the start of the sequence. Each agent prompt is re-rendered with a
-        # full chat template (another BOS), so the repeated BOS must be removed.
-        # Batches are left-padded, so the BOS is the first ACTIVE token per row.
-        bos_token_id = self.model.tokenizer.bos_token_id
-        if (
-            past_key_values is None
-            or _past_length(past_key_values) == 0
-            or bos_token_id is None
-        ):
-            return input_ids, attention_mask
-
-        pad_id = self.model.tokenizer.pad_token_id or 0
-        device = input_ids.device
-        actives: List[torch.Tensor] = []
-        for ids, mask in zip(input_ids, attention_mask):
-            active = ids[mask.bool()]
-            if active.numel() > 0 and active[0].item() == bos_token_id:
-                active = active[1:]
-            actives.append(active)
-
-        max_len = max(x.numel() for x in actives)
-        new_ids: List[torch.Tensor] = []
-        new_masks: List[torch.Tensor] = []
-        for active in actives:
-            pad_len = max_len - active.numel()
-            new_ids.append(
-                torch.cat(
-                    [
-                        torch.full((pad_len,), pad_id, dtype=input_ids.dtype, device=device),
-                        active,
-                    ]
-                )
-            )
-            new_masks.append(
-                torch.cat(
-                    [
-                        torch.zeros(pad_len, dtype=attention_mask.dtype, device=device),
-                        torch.ones(active.numel(), dtype=attention_mask.dtype, device=device),
-                    ]
-                )
-            )
-        return torch.stack(new_ids, dim=0), torch.stack(new_masks, dim=0)
-
     @torch.no_grad()
     def run_batch(self, items: List[Dict]) -> List[Dict]:
         if len(items) > self.generate_bs:
@@ -217,10 +164,6 @@ class LatentMASMethod:
                 )
                 wrapped_ids = wrapped_encoded["input_ids"].to(self.model.device)
                 wrapped_mask = wrapped_encoded["attention_mask"].to(self.model.device)
-                if self.latent_turn_fixes:
-                    wrapped_ids, wrapped_mask = self._strip_bos_from_cached_batch(
-                        wrapped_ids, wrapped_mask, past_kv
-                    )
                 wrapped_tokens_batch: List[List[str]] = []
                 for ids_row, mask_row in zip(wrapped_ids, wrapped_mask):
                     active_ids = ids_row[mask_row.bool()].tolist()
@@ -241,17 +184,6 @@ class LatentMASMethod:
                     past_attention_mask = self._truncate_attention_mask(
                         past_attention_mask, tokens_to_keep
                     )
-
-                # Close the assistant turn in the cache so the next agent prompt
-                # starts on a clean boundary instead of continuing this latent
-                # response. Llama uses <|eot_id|>; Qwen uses <|im_end|>.
-                if self.latent_turn_fixes:
-                    eot_token = "<|eot_id|>" if self.model.model_type == "llama" else "<|im_end|>"
-                    eot_id = self.model.tokenizer.convert_tokens_to_ids(eot_token)
-                    if eot_id is not None and eot_id >= 0 and eot_id != self.model.tokenizer.unk_token_id:
-                        past_kv, past_attention_mask = self.model.append_token_to_past_batch(
-                            eot_id, past_kv, past_attention_mask
-                        )
 
                 for idx in range(batch_size):
                     mask = wrapped_mask[idx].bool()
@@ -287,10 +219,6 @@ class LatentMASMethod:
                 )
                 judger_ids = judger_encoded["input_ids"].to(self.model.device)
                 judger_mask = judger_encoded["attention_mask"].to(self.model.device)
-                if self.latent_turn_fixes:
-                    judger_ids, judger_mask = self._strip_bos_from_cached_batch(
-                        judger_ids, judger_mask, past_for_decoding
-                    )
                 judger_tokens_batch: List[List[str]] = []
                 for ids_row, mask_row in zip(judger_ids, judger_mask):
                     active_ids = ids_row[mask_row.bool()].tolist()

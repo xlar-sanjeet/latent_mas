@@ -139,8 +139,6 @@ def main():
                         help="Keep only newly added tokens (latent + prompt) between agents.")
     parser.add_argument("--debug_probe", action="store_true",
                         help="Decode latent vectors to nearest vocabulary tokens for debugging.")
-    parser.add_argument("--latent_turn_fixes", action="store_true",
-                        help="Enable experimental Llama turn-boundary fixes (BOS strip + eot append).")
     parser.add_argument(
         "--realign_regularization",
         type=float,
